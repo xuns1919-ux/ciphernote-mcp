@@ -1,0 +1,24 @@
+{
+  "name": "ciphernote-mcp",
+  "version": "0.1.0",
+  "description": "A local-first, encrypted notebook MCP server.",
+  "type": "module",
+  "bin": {
+    "ciphernote-mcp": "src/server.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "python -m unittest discover -s tests -v"
+  },
+  "keywords": ["mcp", "notebook", "notes", "encryption", "local-first"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20",
+    "python": ">=3.10"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.8"
+  }
+}
+
