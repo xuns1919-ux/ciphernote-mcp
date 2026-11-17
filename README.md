@@ -22,7 +22,8 @@
 | 🔒 加密存储 | 标题、正文和标签在写入 SQLite 前使用 AES-256-GCM 加密 |
 | 🏠 本地优先 | 不包含云同步、遥测、分析或任何远程 API 请求 |
 | 🔎 本地搜索 | 笔记仅在本机内存中解密和搜索 |
-| 🧩 MCP 支持 | 可连接支持 MCP 的 AI 客户端 |
+| 🧩 MCP 支持 | 支持本地 stdio 和远程 Streamable HTTP |
+| 🌐 安全远程访问 | 内置 Bearer 鉴权、Host 校验和可选 TLS |
 | 🛡️ 凭据拦截 | 自动拒绝疑似密码、令牌、私钥等敏感凭据 |
 | 📦 轻量部署 | Node.js 负责 MCP 通信，Python 负责加密存储 |
 
@@ -112,7 +113,68 @@ CIPHERNOTE_KEY=base64:YOUR_RANDOM_KEY
 npm start
 ```
 
-服务使用标准输入输出（stdio）与 MCP 客户端通信。协议消息写入标准输出，诊断信息写入标准错误。
+默认模式继续使用标准输入输出（stdio）与 MCP 客户端通信。协议消息写入标准输出，诊断信息写入标准错误。
+
+## 🌐 Streamable HTTP
+
+v0.2.0 起可以直接提供原生 Streamable HTTP，无需额外 wrapper。HTTP 模式始终要求至少
+32 字符的 Bearer Token；缺少或错误的 Token 返回 `401 Unauthorized`。
+
+生成 Token 并限制文件权限：
+
+```bash
+umask 077
+openssl rand -hex 32 > /etc/ciphernote-mcp/token
+```
+
+推荐在 Nginx、Caddy 等 TLS 反向代理后仅监听回环地址：
+
+```bash
+export CIPHERNOTE_TRANSPORT=http
+export CIPHERNOTE_HOST=127.0.0.1
+export CIPHERNOTE_PORT=18060
+export CIPHERNOTE_HTTP_PATH=/mcp
+export CIPHERNOTE_AUTH_TOKEN_FILE=/etc/ciphernote-mcp/token
+export CIPHERNOTE_ALLOWED_HOSTS=notes.example.com
+npm start
+```
+
+客户端连接 `https://notes.example.com/mcp`，传输方式选择 Streamable HTTP，并发送：
+
+```text
+Authorization: Bearer YOUR_TOKEN
+```
+
+反向代理必须保留 `Authorization` 请求头，并关闭响应缓冲。Nginx 示例：
+
+```nginx
+location = /mcp {
+    proxy_pass http://127.0.0.1:18060/mcp;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+}
+```
+
+也可以由 CipherNote 直接终止 TLS，此时证书和私钥必须同时设置：
+
+```bash
+export CIPHERNOTE_TRANSPORT=http
+export CIPHERNOTE_HOST=0.0.0.0
+export CIPHERNOTE_PORT=8443
+export CIPHERNOTE_AUTH_TOKEN_FILE=/etc/ciphernote-mcp/token
+export CIPHERNOTE_ALLOWED_HOSTS=notes.example.com
+export CIPHERNOTE_TLS_CERT=/etc/letsencrypt/live/notes.example.com/fullchain.pem
+export CIPHERNOTE_TLS_KEY=/etc/letsencrypt/live/notes.example.com/privkey.pem
+npm start
+```
+
+非回环监听如果没有 TLS 或没有显式的允许 Host 列表，服务会拒绝启动。生产环境只应开放
+HTTPS 端口，不要将未加密的后端端口暴露到公网。`GET /healthz` 是不含敏感信息的健康检查。
 
 ## ⚙️ 环境变量
 
@@ -121,6 +183,16 @@ npm start
 | `CIPHERNOTE_KEY` | 是 | 无 | 32 字节密钥，必须使用 `base64:` 或 `hex:` 前缀 |
 | `CIPHERNOTE_DB` | 否 | 系统本地数据目录 | 自定义 SQLite 数据库路径 |
 | `CIPHERNOTE_PYTHON` | 否 | Windows 使用 `python`，其他系统使用 `python3` | 自定义 Python 可执行文件 |
+| `CIPHERNOTE_TRANSPORT` | 否 | `stdio` | `stdio` 或 `http` |
+| `CIPHERNOTE_HOST` | HTTP | `127.0.0.1` | HTTP 监听地址 |
+| `CIPHERNOTE_PORT` | HTTP | `18060` | HTTP 监听端口 |
+| `CIPHERNOTE_HTTP_PATH` | HTTP | `/mcp` | Streamable HTTP 路径 |
+| `CIPHERNOTE_AUTH_TOKEN` | 二选一 | 无 | 至少 32 字符的 Bearer Token |
+| `CIPHERNOTE_AUTH_TOKEN_FILE` | 二选一 | 无 | 从受保护文件读取 Bearer Token |
+| `CIPHERNOTE_ALLOWED_HOSTS` | 远程 HTTP | 回环地址 | 逗号分隔的允许 Host 名称 |
+| `CIPHERNOTE_TLS_CERT` | 可选 | 无 | PEM 证书链，必须和 TLS 私钥同时设置 |
+| `CIPHERNOTE_TLS_KEY` | 可选 | 无 | PEM 私钥，必须和 TLS 证书同时设置 |
+| `CIPHERNOTE_MAX_BODY_BYTES` | 否 | `1048576` | HTTP 请求体限制，最大 10 MiB |
 
 默认数据库位置：
 
@@ -170,9 +242,12 @@ ciphernote-mcp/
 ├── scripts/
 │   └── generate_key.py   # 安全生成随机密钥
 ├── src/
-│   ├── server.js         # MCP 服务入口
+│   ├── server.js         # stdio/HTTP 启动入口
+│   ├── ciphernote.js     # MCP server factory 和工具注册
+│   ├── http.js           # Streamable HTTP、TLS 和 Bearer 鉴权
 │   └── store.py          # 加密和 SQLite 存储层
 ├── tests/
+│   ├── http.test.js      # HTTP、鉴权、Host 和 MCP 集成测试
 │   └── test_store.py     # 存储、加密和凭据拦截测试
 ├── .env.example          # 环境变量示例，不包含真实密钥
 ├── SECURITY.md           # 安全策略与威胁模型
