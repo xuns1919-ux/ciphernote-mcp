@@ -3,6 +3,7 @@ import importlib.util
 import os
 import secrets
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from pathlib import Path
 
@@ -65,10 +66,29 @@ class PrivacyStoreTests(unittest.TestCase):
         self.assertEqual(store.commit_draft({"_subject": "subject-b", "draft_id": draft["draft_id"]})["reason"], "draft_not_found_or_unauthorized")
         committed = store.commit_draft({"_subject": "subject-a", "draft_id": draft["draft_id"]})
         self.assertTrue(committed["success"])
-        self.assertEqual(store.commit_draft({"_subject": "subject-a", "draft_id": draft["draft_id"]})["reason"], "draft_not_found_or_unauthorized")
+        retry = store.commit_draft({"_subject": "subject-a", "draft_id": draft["draft_id"]})
+        self.assertTrue(retry["success"])
+        self.assertEqual(retry["note_id"], committed["note_id"])
+        self.assertTrue(retry.get("idempotent"))
         raw = Path(self.temp.name, "draft.db").read_bytes()
         self.assertNotIn("安全正文".encode(), raw)
 
 
+    def test_concurrent_commit_is_idempotent_and_expired_draft_is_removed(self):
+        store = load_store(Path(self.temp.name) / "concurrent.db", "private")
+        draft = store.create_draft({"_subject": "subject-a", "title": "并发标题", "content": "并发正文", "tags": []})
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: store.commit_draft({"_subject": "subject-a", "draft_id": draft["draft_id"]}), range(8)))
+        self.assertTrue(all(result["success"] for result in results))
+        self.assertEqual({result["note_id"] for result in results}, {results[0]["note_id"]})
+        self.assertEqual(sum(1 for result in results if result.get("idempotent")), 7)
+        expired = store.create_draft({"_subject": "subject-a", "title": "过期标题", "content": "过期正文", "tags": []})
+        db = store.connect()
+        try:
+            db.execute("UPDATE secure_drafts SET expires_at=0 WHERE id=?", (expired["draft_id"],))
+            db.commit()
+        finally:
+            db.close()
+        self.assertEqual(store.commit_draft({"_subject": "subject-a", "draft_id": expired["draft_id"]})["reason"], "draft_not_found_or_unauthorized")
 if __name__ == "__main__":
     unittest.main()

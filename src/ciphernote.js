@@ -81,7 +81,7 @@ function registerCommonTools(server, subject) {
   }
 }
 
-export function createCipherNoteServer({ subject = "stdio" } = {}) {
+export function createCipherNoteServer({ subject = (process.env.CIPHERNOTE_SUBJECT_ID || "stdio") } = {}) {
   const mode = privacyMode();
   const server = new McpServer({ name: "ciphernote-mcp", version: SERVER_VERSION });
 

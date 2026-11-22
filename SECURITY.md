@@ -63,3 +63,8 @@ Production guidance:
 - keep CIPHERNOTE_KEY and the Bearer token in separate protected files;
 - back up the encrypted database and key separately;
 - rollback v0.3.0 by stopping the service, restoring the previous source and environment, and retaining the database (the new secure_drafts table is additive and ignored by v0.2.0).
+
+
+### Cross-transport subject
+
+CIPHERNOTE_SUBJECT_ID is an optional stable random deployment subject for a single-user instance. Without it, HTTP uses a hash of the Bearer token and stdio uses stdio, so drafts cannot cross transports. With it, only the already-authenticated HTTP Bearer path and the trusted local stdio process share the same deployment authority. This does not create per-user isolation; use separate instances or an identity-aware proxy for multiple people.

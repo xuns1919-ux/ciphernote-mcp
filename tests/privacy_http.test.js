@@ -35,6 +35,11 @@ test("private secure capture keeps plaintext out of MCP draft parameters", async
   assert.match(await loginPage.text(), /Secure Capture/);
   const login = await fetch(`${base}/notes/capture/login`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: TOKEN }) });
   assert.equal(login.status, 200);
+  assert.match(login.headers.get("set-cookie"), /HttpOnly/);
+  const missingSession = await fetch(`${base}/notes/capture/save`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: "x", content: "y" }) });
+  assert.equal(missingSession.status, 401);
+  const csrf = await fetch(`${base}/notes/capture/drafts`, { method: "POST", headers: { origin: "https://evil.example", "content-type": "application/json" }, body: JSON.stringify({ title: "x", content: "y" }) });
+  assert.equal(csrf.status, 403);
   const cookie = login.headers.get("set-cookie").split(";", 1)[0];
   const draftResponse = await fetch(`${base}/notes/capture/drafts`, {
     method: "POST", headers: { cookie, "content-type": "application/json" },

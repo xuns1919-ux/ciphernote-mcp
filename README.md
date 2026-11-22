@@ -329,3 +329,8 @@ private/strict 模式下如果启用 CIPHERNOTE_DIRECT_WRITE_ENABLED=true，普�
 - 数据库加密、MCP 参数、MCP 返回值、客户端历史和模型上下文是五个不同层面。
 - private/strict 的搜索结果不能让模型假装已经读过正文；只有 note ID/计数可见。
 - 无法实际运行的客户端界面不应标记为隐私 PASS；需分别测试 Operit、Anejul、Kelivo、Opeiro、Claude Desktop、Cherry Studio。
+
+
+### stdio 与 HTTP 主体
+
+默认情况下，HTTP draft 绑定 Bearer Token 哈希，而 stdio 使用 stdio 主体，二者不会互相提交 draft。单人专用实例如需让受信 stdio 客户端提交浏览器创建的 draft，可设置 CIPHERNOTE_SUBJECT_ID 为至少 32 个字符的随机值；HTTP 和 stdio 会共享该部署主体，但这不是多用户身份隔离。不要把该值作为 URL 参数或工具参数传递。

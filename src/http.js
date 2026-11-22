@@ -96,6 +96,8 @@ export function loadHttpConfig(env = process.env) {
   if (!["standard", "private", "strict"].includes(privacyMode)) throw new Error("CIPHERNOTE_PRIVACY_MODE must be standard, private, or strict");
   const secureCaptureEnabled = env.CIPHERNOTE_SECURE_CAPTURE_ENABLED === "true" ||
     (env.CIPHERNOTE_SECURE_CAPTURE_ENABLED === undefined && privacyMode !== "standard");
+  const subject = (env.CIPHERNOTE_SUBJECT_ID || "").trim();
+  if (subject && subject.length < 32) throw new Error("CIPHERNOTE_SUBJECT_ID must be at least 32 characters when set");
   return {
     host,
     port: parsePort(env.CIPHERNOTE_PORT),
@@ -105,6 +107,7 @@ export function loadHttpConfig(env = process.env) {
     maxBodyBytes,
     privacyMode,
     secureCaptureEnabled,
+    subject: subject || null,
     tls: certFile && keyFile
       ? { cert: readFileSync(certFile), key: readFileSync(keyFile), minVersion: "TLSv1.2" }
       : undefined,
@@ -130,6 +133,8 @@ function sendJson(res, status, value, extraHeaders = {}) {
     "content-type": "application/json; charset=utf-8",
     "content-length": Buffer.byteLength(body),
     "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "no-referrer",
     ...extraHeaders,
   });
   res.end(body);
@@ -166,6 +171,10 @@ async function readJsonBody(req, limit) {
 
 const captureSessions = new Map();
 
+function configuredSubject(config, token) {
+  return config.subject || tokenSubject(token);
+}
+
 function tokenSubject(token) {
   return createHash("sha256").update(token).digest("hex");
 }
@@ -194,7 +203,7 @@ function capturePage(authenticated) {
   if (!authenticated) {
     return '<!doctype html><meta charset="utf-8"><title>CipherNote Secure Capture</title><h1>Secure Capture</h1><p>输入 Bearer Token 建立安全会话。</p><form id="f"><input id="t" type="password" required><button>登录</button></form><pre id="o"></pre><script>f.onsubmit=async(e)=>{e.preventDefault();const r=await fetch("/notes/capture/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({token:t.value})});o.textContent=r.ok?"登录成功，请刷新":"认证失败";if(r.ok)location.reload()}</script>';
   }
-  return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>CipherNote Secure Capture</title><h1>Secure Capture</h1><p>正文直接发送到服务端，不经过 MCP 工具参数。</p><form id="f"><input id="t" maxlength="200" placeholder="标题" required><textarea id="c" maxlength="100000" placeholder="正文" required></textarea><input id="g" placeholder="标签，用逗号分隔"><input id="i" type="number" min="0" max="5" value="0"><button type="button" id="s">安全保存</button><button type="button" id="d">创建暂存引用</button></form><pre id="o"></pre><script>const body=()=>({title:t.value,content:c.value,tags:g.value.split(",").map(x=>x.trim()).filter(Boolean),importance:Number(i.value)});async function send(path){const r=await fetch(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body())});o.textContent=JSON.stringify(await r.json(),null,2)};s.onclick=()=>send("/notes/capture/save");d.onclick=()=>send("/notes/capture/drafts")</script>';
+return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>CipherNote Secure Capture</title><style>body{font:16px system-ui;max-width:720px;margin:1rem auto;padding:0 1rem}textarea,input{box-sizing:border-box;width:100%;margin:.35rem 0;padding:.6rem}textarea{min-height:12rem}button{padding:.65rem 1rem;margin:.35rem .35rem .35rem 0}section{border:1px solid #ccc;border-radius:8px;padding:1rem;margin:1rem 0}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style><h1>Secure Capture</h1><p>正文直接发送到服务端，不经过 MCP 工具参数。</p><section><h2>保存</h2><input id="t" maxlength="200" placeholder="标题" required><textarea id="c" maxlength="100000" placeholder="正文" required></textarea><input id="g" placeholder="标签，用逗号分隔"><input id="i" type="number" min="0" max="5" value="0"><button id="s">安全保存</button><button id="d">创建暂存引用</button></section><section><h2>查看或删除</h2><input id="n" maxlength="128" placeholder="note_id"><button id="r">查看笔记</button><button id="x">删除笔记</button></section><pre id="o" aria-live="polite"></pre><script>const $=id=>document.getElementById(id);const out=value=>$("o").textContent=typeof value==="string"?value:JSON.stringify(value,null,2);async function api(path,body){const r=await fetch(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body||{})});let value;try{value=await r.json()}catch{value={error:"invalid_server_response"}}if(r.status===401){out("会话已过期，请重新登录");setTimeout(()=>location.reload(),1200);return}out(value)}function noteBody(){return{title:$("t").value,content:$("c").value,tags:$("g").value.split(",").map(x=>x.trim()).filter(Boolean),importance:Number($("i").value)}}$("s").onclick=()=>api("/notes/capture/save",noteBody());$("d").onclick=()=>api("/notes/capture/drafts",noteBody());$("r").onclick=()=>api("/notes/capture/read",{note_id:$("n").value});$("x").onclick=()=>{if(confirm("确认永久删除这条笔记？"))api("/notes/capture/delete",{note_id:$("n").value})}</script>`;
 }
 
 async function handleCapture(req, res, requestUrl, config, readJsonBody) {
@@ -202,7 +211,7 @@ async function handleCapture(req, res, requestUrl, config, readJsonBody) {
   if (!sameOrigin(req, config)) { sendJson(res, 403, { error: "csrf_or_origin_rejected" }); return true; }
   const secure = config.tls || req.headers["x-forwarded-proto"] === "https";
   if (req.method === "GET" && requestUrl.pathname === "/notes/capture") {
-    res.writeHead(200, { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" });
+    res.writeHead(200, { "cache-control": "no-store", "content-type": "text/html; charset=utf-8", "x-frame-options": "DENY", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer" });
     res.end(capturePage(Boolean(captureSession(req))));
     return true;
   }
@@ -210,7 +219,7 @@ async function handleCapture(req, res, requestUrl, config, readJsonBody) {
     const body = await readJsonBody(req, config.maxBodyBytes);
     if (typeof body.token !== "string" || !hasValidBearer("Bearer " + body.token, config.token)) { sendJson(res, 401, { error: "unauthorized" }); return true; }
     const id = randomBytes(32).toString("base64url");
-    captureSessions.set(id, { subject: tokenSubject(body.token), expiresAt: Date.now() + 3600000 });
+    captureSessions.set(id, { subject: configuredSubject(config, body.token), expiresAt: Date.now() + 3600000 });
     sendJson(res, 200, { success: true }, { "set-cookie": "ciphernote_capture=" + id + "; Path=/notes/capture; Max-Age=3600; HttpOnly; SameSite=Strict" + (secure ? "; Secure" : "") });
     return true;
   }
@@ -257,7 +266,7 @@ export function createCipherNoteHttpService(config, serverFactory) {
       const parsedBody = req.method === "POST" ? await readJsonBody(req, config.maxBodyBytes) : undefined;
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       const match = /^Bearer ([^\s]+)$/.exec(req.headers.authorization || "");
-      mcpServer = serverFactory({ subject: tokenSubject(match ? match[1] : "") });
+      mcpServer = serverFactory({ subject: configuredSubject(config, match ? match[1] : "") });
       await mcpServer.connect(transport);
       await transport.handleRequest(req, res, parsedBody);
     } catch (error) {
@@ -276,6 +285,7 @@ export function createCipherNoteHttpService(config, serverFactory) {
   const service = config.tls ? createHttpsServer(config.tls, handler) : createHttpServer(handler);
   service.headersTimeout = 10_000;
   service.requestTimeout = 30_000;
+  service.maxHeadersCount = 100;
   service.keepAliveTimeout = 65_000;
   return service;
 }

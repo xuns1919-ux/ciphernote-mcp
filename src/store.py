@@ -35,7 +35,7 @@ MAX_NOTE_BYTES = 100_000
 DRAFT_TTL_SECONDS = max(60, min(86_400, int(os.environ.get("CIPHERNOTE_SECURE_CAPTURE_TTL_SECONDS", "900"))))
 PRIVACY_MODE = os.environ.get("CIPHERNOTE_PRIVACY_MODE", "standard").strip().lower()
 if PRIVACY_MODE not in {"standard", "private", "strict"}:
-    PRIVACY_MODE = "standard"
+    raise ValueError("CIPHERNOTE_PRIVACY_MODE must be standard, private, or strict")
 KEY_CONTEXT = b"ciphernote-mcp-content-hmac-v1\0"
 CREDENTIAL_RE = re.compile(
     r"(?:api[_ -]?key|secret|password|passwd|access[_ -]?token|refresh[_ -]?token|cookie|"
@@ -139,6 +139,7 @@ def connect() -> sqlite3.Connection:
         expires_at INTEGER NOT NULL
     )""")
     db.execute("CREATE INDEX IF NOT EXISTS idx_secure_drafts_expiry ON secure_drafts(expires_at)")
+    db.execute("""CREATE TABLE IF NOT EXISTS draft_commits (draft_id TEXT PRIMARY KEY, note_id TEXT NOT NULL, committed_at TEXT NOT NULL)""")
     db.commit()
     try:
         if os.name != "nt":
@@ -323,26 +324,51 @@ def commit_draft(args: dict) -> dict:
     subject = str(args.get("_subject") or "")
     if not draft_id.startswith("draft_"):
         return {"success": False, "reason": "invalid_draft_id"}
-    with closing(connect()) as db:
-        db.execute("DELETE FROM secure_drafts WHERE expires_at <= ?", (int(time.time()),))
-        row = db.execute("SELECT * FROM secure_drafts WHERE id=?", (draft_id,)).fetchone()
-        if row is None or not hmac.compare_digest(row[1], subject_hash(subject)):
-            return {"success": False, "reason": "draft_not_found_or_unauthorized"}
-        nonce = bytes(row[5])
-        try:
-            title = decrypt(draft_id, "title", row[2], nonce)
-            content = decrypt(draft_id, "content", row[3], nonce)
-            tags = json.loads(decrypt(draft_id, "tags", row[4], nonce))
-        except Exception:
-            return {"success": False, "reason": "draft_integrity_failed"}
-        importance = row[6]
-    result = write_note({"title": title, "content": content, "tags": tags, "importance": importance, "_secure_capture": True})
-    if result.get("success"):
+    try:
         with closing(connect()) as db:
+            # Serialize consumers and keep note insertion, commit marker, and draft
+            # removal in one SQLite transaction. A crash rolls back all three.
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM secure_drafts WHERE expires_at <= ?", (int(time.time()),))
+            prior = db.execute("SELECT note_id FROM draft_commits WHERE draft_id=?", (draft_id,)).fetchone()
+            if prior is not None:
+                db.commit()
+                return {"success": True, "note_id": prior[0], "idempotent": True}
+            row = db.execute("SELECT * FROM secure_drafts WHERE id=?", (draft_id,)).fetchone()
+            if row is None or not hmac.compare_digest(row[1], subject_hash(subject)):
+                db.rollback()
+                return {"success": False, "reason": "draft_not_found_or_unauthorized"}
+            nonce = bytes(row[5])
+            try:
+                title = decrypt(draft_id, "title", row[2], nonce)
+                content = decrypt(draft_id, "content", row[3], nonce)
+                tags = json.loads(decrypt(draft_id, "tags", row[4], nonce))
+            except Exception:
+                db.rollback()
+                return {"success": False, "reason": "draft_integrity_failed"}
+            note_id = "note_" + uuid.uuid4().hex
+            row_nonce = os.urandom(32)
+            timestamp = now()
+            digest = hmac.new(HMAC_KEY, canonical(title, content, tags), hashlib.sha256).hexdigest()
+            db.execute("INSERT INTO notes VALUES (?,?,?,?,?,?,?,?,?)", (
+                note_id,
+                encrypt(note_id, "title", title, row_nonce),
+                encrypt(note_id, "content", content, row_nonce),
+                encrypt(note_id, "tags", json.dumps(tags, ensure_ascii=False), row_nonce),
+                sqlite3.Binary(row_nonce), timestamp, timestamp, row[6], digest,
+            ))
+            db.execute("INSERT INTO draft_commits VALUES (?,?,?)", (draft_id, note_id, timestamp))
             db.execute("DELETE FROM secure_drafts WHERE id=?", (draft_id,))
             db.commit()
-    return result
-
+            return {"success": True, "note_id": note_id}
+    except sqlite3.IntegrityError:
+        with closing(connect()) as db:
+            prior = db.execute("SELECT note_id FROM draft_commits WHERE draft_id=?", (draft_id,)).fetchone()
+        if prior is not None:
+            return {"success": True, "note_id": prior[0], "idempotent": True}
+        return {"success": False, "reason": "draft_commit_conflict"}
+    except Exception:
+        return {"success": False, "reason": "draft_commit_failed"}
 def dispatch(request: dict) -> dict:
     if KEY is None:
         return {"success": False, "reason": "disabled_invalid_or_missing_key"}
