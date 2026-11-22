@@ -50,6 +50,14 @@ test("private secure capture keeps plaintext out of MCP draft parameters", async
   assert.ok(draft.draft_id.startsWith("draft_"));
   assert.equal(JSON.stringify(draft).includes("隐藏正文"), false);
 
+  const savedResponse = await fetch(`${base}/notes/capture/save`, { method: "POST", headers: { cookie, "content-type": "application/json" }, body: JSON.stringify({ title: "页面标题", content: "页面正文", tags: ["页面标签"], importance: 2 }) });
+  const saved = await savedResponse.json();
+  assert.equal(saved.success, true);
+  const readResponse = await fetch(`${base}/notes/capture/read`, { method: "POST", headers: { cookie, "content-type": "application/json" }, body: JSON.stringify({ note_id: saved.note_id }) });
+  const read = await readResponse.json();
+  assert.equal(read.content, "页面正文");
+  const deleteResponse = await fetch(`${base}/notes/capture/delete`, { method: "POST", headers: { cookie, "content-type": "application/json" }, body: JSON.stringify({ note_id: saved.note_id }) });
+  assert.equal((await deleteResponse.json()).success, true);
   const initialize = await fetch(`${base}/mcp`, { method: "POST", headers: headers(), body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) });
   assert.equal(initialize.status, 200);
   const commit = await fetch(`${base}/mcp`, {
