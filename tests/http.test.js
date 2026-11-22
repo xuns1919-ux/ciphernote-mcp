@@ -134,3 +134,9 @@ test("Streamable HTTP initialize succeeds with authentication", async (t) => {
     assert.match(toolsBody, new RegExp(name));
   }
 });
+
+test("invalid privacy mode and explicit cross-transport subject fail closed", () => {
+  assert.throws(() => loadHttpConfig({ CIPHERNOTE_AUTH_TOKEN: TOKEN, CIPHERNOTE_PRIVACY_MODE: "unsafe" }), /PRIVACY_MODE/);
+  const loaded = loadHttpConfig({ CIPHERNOTE_AUTH_TOKEN: TOKEN, CIPHERNOTE_PRIVACY_MODE: "private", CIPHERNOTE_SUBJECT_ID: "0123456789abcdef0123456789abcdef" });
+  assert.equal(loaded.subject, "0123456789abcdef0123456789abcdef");
+});

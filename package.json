@@ -1,6 +1,6 @@
 {
   "name": "ciphernote-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A local-first, encrypted notebook MCP server.",
   "type": "module",
   "bin": {
@@ -12,7 +12,13 @@
     "test:node": "node --test tests/*.test.js",
     "test:python": "python -m unittest discover -s tests -v"
   },
-  "keywords": ["mcp", "notebook", "notes", "encryption", "local-first"],
+  "keywords": [
+    "mcp",
+    "notebook",
+    "notes",
+    "encryption",
+    "local-first"
+  ],
   "license": "MIT",
   "engines": {
     "node": ">=20",

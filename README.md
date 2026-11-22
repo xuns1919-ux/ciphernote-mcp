@@ -117,7 +117,7 @@ npm start
 
 ## 🌐 Streamable HTTP
 
-v0.2.0 起可以直接提供原生 Streamable HTTP，无需额外 wrapper。HTTP 模式始终要求至少
+v0.3.0 起可以直接提供原生 Streamable HTTP，无需额外 wrapper。HTTP 模式始终要求至少
 32 字符的 Bearer Token；缺少或错误的 Token 返回 `401 Unauthorized`。
 
 生成 Token 并限制文件权限：
@@ -285,3 +285,66 @@ node --check src/server.js
 **数据属于你，密钥也属于你。**
 
 </div>
+
+
+## Universal Privacy Mode（v0.3.0）
+
+CIPHERNOTE_PRIVACY_MODE 默认是 standard，未设置时保持 v0.2.0 的兼容行为：
+
+- standard：五个旧工具全部可见；明文写入、搜索摘要和完整读取仍可能进入 MCP 客户端参数/结果。
+- private：默认不注册明文写入工具；搜索只返回匹配数量和 note ID，recent 隐藏标题/标签，read/delete 需要独立安全页面；增加 private_note_commit_draft。
+- strict：不返回正文、标题或标签；搜索只返回数量，recent 只返回 ID；普通 MCP 不提供明文写入，完整内容仅能在认证的 Secure Capture 页面处理。
+
+标准 MCP 无法控制客户端是否显示、复制或保存已经收到的工具参数。因此 private/strict 不把“折叠工具卡片”当作隐私边界。
+
+### Secure Capture
+
+HTTP 模式启用 private/strict 时，默认提供：
+
+    https://<你的域名>/notes/capture
+
+页面登录使用同一个部署 Bearer Token 建立短时 HttpOnly、SameSite 会话。标题、正文和标签从浏览器通过 HTTPS 直接提交服务端，不经过 MCP 工具参数。
+
+页面支持：
+
+- 直接安全保存；
+- 创建短时一次性 draft_id；
+- MCP 仅调用 private_note_commit_draft({"draft_id":"draft_..."}) 完成提交。
+
+draft 内容在 SQLite 的 secure_drafts 表中加密保存，默认 900 秒过期，成功提交后删除，绑定登录主体并防止重复提交。draft ID 不包含标题或正文。
+
+当前主体绑定是“部署 Bearer Token 的哈希 + 浏览器会话”，不是多用户账户系统。多个用户共享一个 Bearer Token 时仍共享同一权限；需要真正用户隔离时，请为每个主体部署独立实例或在反向代理增加身份映射。不要把 user_id 作为工具参数当作授权依据。
+
+### 配置
+
+    CIPHERNOTE_PRIVACY_MODE=private
+    CIPHERNOTE_SECURE_CAPTURE_ENABLED=true
+    CIPHERNOTE_SECURE_CAPTURE_TTL_SECONDS=900
+    CIPHERNOTE_DIRECT_WRITE_ENABLED=false
+
+private/strict 模式下如果启用 CIPHERNOTE_DIRECT_WRITE_ENABLED=true，普通写入参数可能出现在客户端历史和模型上下文中，不能称为“无明文传输”。
+
+### 能力边界
+
+- 数据库加密、MCP 参数、MCP 返回值、客户端历史和模型上下文是五个不同层面。
+- private/strict 的搜索结果不能让模型假装已经读过正文；只有 note ID/计数可见。
+- 无法实际运行的客户端界面不应标记为隐私 PASS；需分别测试 Operit、Anejul、Kelivo、Opeiro、Claude Desktop、Cherry Studio。
+
+
+### stdio 与 HTTP 主体
+
+默认情况下，HTTP draft 绑定 Bearer Token 哈希，而 stdio 使用 stdio 主体，二者不会互相提交 draft。单人专用实例如需让受信 stdio 客户端提交浏览器创建的 draft，可设置 CIPHERNOTE_SUBJECT_ID 为至少 32 个字符的随机值；HTTP 和 stdio 会共享该部署主体，但这不是多用户身份隔离。不要把该值作为 URL 参数或工具参数传递。
+
+
+### HTTPS 反向代理与 Android 验收
+
+反向代理终止 HTTPS 时，仅在代理可信且只允许 loopback 访问后端时设置 CIPHERNOTE_TRUST_PROXY=true；否则保持 false，服务端不会信任客户端伪造的 X-Forwarded-Proto。Secure Capture 的 Cookie 修改请求必须带与实际 HTTPS 主机、协议和端口完全一致的 Origin。
+
+手机配置示例（不包含真实 Token）：
+
+- MCP 地址：https://<你的域名>/mcp`r
+- Bearer Token：在手机 MCP 设置的安全凭据字段中粘贴，不写入 URL、聊天或截图。
+- Secure Capture：https://<你的域名>/notes/capture`r
+- private 模式 tools/list 应包含搜索、读取/删除受限工具和 private_note_commit_draft，默认不包含 private_note_write。
+- 在网页创建虚构 draft 后，把返回的 draft_id 作为唯一 MCP 参数提交。
+- 在 Operit/Anejul 中检查折叠、展开、复制和历史记录；真实客户端未安装时不得标记 PASS。

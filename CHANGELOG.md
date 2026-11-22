@@ -1,3 +1,9 @@
+## 0.3.0 - Universal Privacy Mode
+
+- Add standard, private, and strict server-side privacy modes.
+- Add encrypted short-lived Secure Capture drafts and one-time MCP commit references.
+- Minimize private/strict search and recent results; require authorization for private reads and deletes.
+
 # Changelog
 
 ## 0.2.0
