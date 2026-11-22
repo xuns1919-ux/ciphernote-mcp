@@ -97,6 +97,7 @@ export function loadHttpConfig(env = process.env) {
   const secureCaptureEnabled = env.CIPHERNOTE_SECURE_CAPTURE_ENABLED === "true" ||
     (env.CIPHERNOTE_SECURE_CAPTURE_ENABLED === undefined && privacyMode !== "standard");
   const subject = (env.CIPHERNOTE_SUBJECT_ID || "").trim();
+  const trustProxy = env.CIPHERNOTE_TRUST_PROXY === "true";
   if (subject && subject.length < 32) throw new Error("CIPHERNOTE_SUBJECT_ID must be at least 32 characters when set");
   return {
     host,
@@ -108,6 +109,7 @@ export function loadHttpConfig(env = process.env) {
     privacyMode,
     secureCaptureEnabled,
     subject: subject || null,
+    trustProxy,
     tls: certFile && keyFile
       ? { cert: readFileSync(certFile), key: readFileSync(keyFile), minVersion: "TLSv1.2" }
       : undefined,
@@ -186,19 +188,27 @@ function captureSession(req) {
   return session;
 }
 
+function canonicalAuthority(protocol, host) {
+  const normalizedProtocol = protocol.endsWith(":") ? protocol : `${protocol}:`;
+  const parsed = new URL(`${normalizedProtocol}//${host}`);
+  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+  return `${parsed.hostname.toLowerCase()}:${port}`;
+}
+
 function sameOrigin(req, config) {
   const origin = req.headers.origin;
   if (!origin) return true;
   try {
+    const forwarded = config.trustProxy ? String(req.headers["x-forwarded-proto"] || "").toLowerCase() : "";
+    const protocol = config.tls ? "https:" : (forwarded === "https" || forwarded === "http" ? `${forwarded}:` : "http:");
     const parsed = new URL(origin);
-    return normalizeHostname(parsed.hostname) === normalizeHostname(req.headers.host || "") &&
-      (parsed.protocol === "https:" || parsed.protocol === "http:") &&
-      config.allowedHosts.has(normalizeHostname(parsed.hostname));
+    if (parsed.protocol !== protocol) return false;
+    if (!config.allowedHosts.has(normalizeHostname(parsed.hostname))) return false;
+    return canonicalAuthority(parsed.protocol, parsed.host) === canonicalAuthority(protocol, req.headers.host || "");
   } catch {
     return false;
   }
 }
-
 function capturePage(authenticated) {
   if (!authenticated) {
     return '<!doctype html><meta charset="utf-8"><title>CipherNote Secure Capture</title><h1>Secure Capture</h1><p>输入 Bearer Token 建立安全会话。</p><form id="f"><input id="t" type="password" required><button>登录</button></form><pre id="o"></pre><script>f.onsubmit=async(e)=>{e.preventDefault();const r=await fetch("/notes/capture/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({token:t.value})});o.textContent=r.ok?"登录成功，请刷新":"认证失败";if(r.ok)location.reload()}</script>';
@@ -209,7 +219,7 @@ return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="widt
 async function handleCapture(req, res, requestUrl, config, readJsonBody) {
   if (!config.secureCaptureEnabled || !requestUrl.pathname.startsWith("/notes/capture")) return false;
   if (!sameOrigin(req, config)) { sendJson(res, 403, { error: "csrf_or_origin_rejected" }); return true; }
-  const secure = config.tls || req.headers["x-forwarded-proto"] === "https";
+  const secure = Boolean(config.tls || (config.trustProxy && req.headers["x-forwarded-proto"] === "https"));
   if (req.method === "GET" && requestUrl.pathname === "/notes/capture") {
     res.writeHead(200, { "cache-control": "no-store", "content-type": "text/html; charset=utf-8", "x-frame-options": "DENY", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer" });
     res.end(capturePage(Boolean(captureSession(req))));
@@ -225,6 +235,7 @@ async function handleCapture(req, res, requestUrl, config, readJsonBody) {
   }
   const session = captureSession(req);
   if (!session) { sendJson(res, 401, { error: "capture_session_required" }); return true; }
+  if (req.method === "POST" && !req.headers.origin) { sendJson(res, 403, { error: "origin_required" }); return true; }
   if (req.method !== "POST" || !["/notes/capture/save", "/notes/capture/drafts", "/notes/capture/read", "/notes/capture/delete"].includes(requestUrl.pathname)) { sendJson(res, 404, { error: "not_found" }); return true; }
   const body = await readJsonBody(req, config.maxBodyBytes);
   const args = { ...body, _secure_capture: true, _subject: session.subject };

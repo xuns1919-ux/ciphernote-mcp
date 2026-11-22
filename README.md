@@ -334,3 +334,17 @@ private/strict 模式下如果启用 CIPHERNOTE_DIRECT_WRITE_ENABLED=true，普�
 ### stdio 与 HTTP 主体
 
 默认情况下，HTTP draft 绑定 Bearer Token 哈希，而 stdio 使用 stdio 主体，二者不会互相提交 draft。单人专用实例如需让受信 stdio 客户端提交浏览器创建的 draft，可设置 CIPHERNOTE_SUBJECT_ID 为至少 32 个字符的随机值；HTTP 和 stdio 会共享该部署主体，但这不是多用户身份隔离。不要把该值作为 URL 参数或工具参数传递。
+
+
+### HTTPS 反向代理与 Android 验收
+
+反向代理终止 HTTPS 时，仅在代理可信且只允许 loopback 访问后端时设置 CIPHERNOTE_TRUST_PROXY=true；否则保持 false，服务端不会信任客户端伪造的 X-Forwarded-Proto。Secure Capture 的 Cookie 修改请求必须带与实际 HTTPS 主机、协议和端口完全一致的 Origin。
+
+手机配置示例（不包含真实 Token）：
+
+- MCP 地址：https://<你的域名>/mcp`r
+- Bearer Token：在手机 MCP 设置的安全凭据字段中粘贴，不写入 URL、聊天或截图。
+- Secure Capture：https://<你的域名>/notes/capture`r
+- private 模式 tools/list 应包含搜索、读取/删除受限工具和 private_note_commit_draft，默认不包含 private_note_write。
+- 在网页创建虚构 draft 后，把返回的 draft_id 作为唯一 MCP 参数提交。
+- 在 Operit/Anejul 中检查折叠、展开、复制和历史记录；真实客户端未安装时不得标记 PASS。

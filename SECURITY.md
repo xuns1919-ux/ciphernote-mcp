@@ -68,3 +68,6 @@ Production guidance:
 ### Cross-transport subject
 
 CIPHERNOTE_SUBJECT_ID is an optional stable random deployment subject for a single-user instance. Without it, HTTP uses a hash of the Bearer token and stdio uses stdio, so drafts cannot cross transports. With it, only the already-authenticated HTTP Bearer path and the trusted local stdio process share the same deployment authority. This does not create per-user isolation; use separate instances or an identity-aware proxy for multiple people.
+
+
+Secure Capture compares the complete Origin scheme, hostname, and effective port. Cookie-bearing modification requests require Origin; missing or mismatched Origin is rejected. CIPHERNOTE_TRUST_PROXY=true is only for a trusted TLS-terminating reverse proxy on a restricted backend; otherwise forwarded protocol headers are ignored.

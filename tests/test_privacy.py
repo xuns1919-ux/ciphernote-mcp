@@ -66,10 +66,20 @@ class PrivacyStoreTests(unittest.TestCase):
         self.assertEqual(store.commit_draft({"_subject": "subject-b", "draft_id": draft["draft_id"]})["reason"], "draft_not_found_or_unauthorized")
         committed = store.commit_draft({"_subject": "subject-a", "draft_id": draft["draft_id"]})
         self.assertTrue(committed["success"])
+        cross_retry = store.commit_draft({"_subject": "subject-b", "draft_id": draft["draft_id"]})
+        self.assertEqual(cross_retry["reason"], "draft_replay_not_authorized")
         retry = store.commit_draft({"_subject": "subject-a", "draft_id": draft["draft_id"]})
         self.assertTrue(retry["success"])
         self.assertEqual(retry["note_id"], committed["note_id"])
         self.assertTrue(retry.get("idempotent"))
+        legacy_db = store.connect()
+        try:
+            legacy_db.execute("INSERT INTO draft_commits (draft_id, note_id, committed_at) VALUES (?,?,?)", ("draft_legacy", "note_hidden", "now"))
+            legacy_db.commit()
+        finally:
+            legacy_db.close()
+        legacy = store.commit_draft({"_subject": "subject-a", "draft_id": "draft_legacy"})
+        self.assertEqual(legacy["reason"], "draft_replay_not_authorized")
         raw = Path(self.temp.name, "draft.db").read_bytes()
         self.assertNotIn("安全正文".encode(), raw)
 

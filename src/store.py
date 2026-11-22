@@ -139,7 +139,11 @@ def connect() -> sqlite3.Connection:
         expires_at INTEGER NOT NULL
     )""")
     db.execute("CREATE INDEX IF NOT EXISTS idx_secure_drafts_expiry ON secure_drafts(expires_at)")
-    db.execute("""CREATE TABLE IF NOT EXISTS draft_commits (draft_id TEXT PRIMARY KEY, note_id TEXT NOT NULL, committed_at TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS draft_commits (draft_id TEXT PRIMARY KEY, note_id TEXT NOT NULL, subject_hash TEXT, committed_at TEXT NOT NULL)""")
+    commit_columns = {row[1] for row in db.execute("PRAGMA table_info(draft_commits)").fetchall()}
+    if "subject_hash" not in commit_columns:
+        # v0.3.0 tables had no subject binding; legacy rows remain NULL and are refused.
+        db.execute("ALTER TABLE draft_commits ADD COLUMN subject_hash TEXT")
     db.commit()
     try:
         if os.name != "nt":
@@ -330,8 +334,11 @@ def commit_draft(args: dict) -> dict:
             # removal in one SQLite transaction. A crash rolls back all three.
             db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM secure_drafts WHERE expires_at <= ?", (int(time.time()),))
-            prior = db.execute("SELECT note_id FROM draft_commits WHERE draft_id=?", (draft_id,)).fetchone()
+            prior = db.execute("SELECT note_id, subject_hash FROM draft_commits WHERE draft_id=?", (draft_id,)).fetchone()
             if prior is not None:
+                if prior[1] is None or not hmac.compare_digest(prior[1], subject_hash(subject)):
+                    db.rollback()
+                    return {"success": False, "reason": "draft_replay_not_authorized"}
                 db.commit()
                 return {"success": True, "note_id": prior[0], "idempotent": True}
             row = db.execute("SELECT * FROM secure_drafts WHERE id=?", (draft_id,)).fetchone()
@@ -357,14 +364,14 @@ def commit_draft(args: dict) -> dict:
                 encrypt(note_id, "tags", json.dumps(tags, ensure_ascii=False), row_nonce),
                 sqlite3.Binary(row_nonce), timestamp, timestamp, row[6], digest,
             ))
-            db.execute("INSERT INTO draft_commits VALUES (?,?,?)", (draft_id, note_id, timestamp))
+            db.execute("INSERT INTO draft_commits (draft_id, note_id, subject_hash, committed_at) VALUES (?,?,?,?)", (draft_id, note_id, subject_hash(subject), timestamp))
             db.execute("DELETE FROM secure_drafts WHERE id=?", (draft_id,))
             db.commit()
             return {"success": True, "note_id": note_id}
     except sqlite3.IntegrityError:
         with closing(connect()) as db:
-            prior = db.execute("SELECT note_id FROM draft_commits WHERE draft_id=?", (draft_id,)).fetchone()
-        if prior is not None:
+            prior = db.execute("SELECT note_id, subject_hash FROM draft_commits WHERE draft_id=?", (draft_id,)).fetchone()
+        if prior is not None and prior[1] is not None and hmac.compare_digest(prior[1], subject_hash(subject)):
             return {"success": True, "note_id": prior[0], "idempotent": True}
         return {"success": False, "reason": "draft_commit_conflict"}
     except Exception:
