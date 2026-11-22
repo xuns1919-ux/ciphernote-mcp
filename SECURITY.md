@@ -39,3 +39,27 @@ Bearer authentication controls access to the MCP endpoint; it does not provide
 per-tool or per-note authorization. Any client holding the token can call every
 tool, including write and permanent delete. Use a dedicated deployment and token
 when clients should not share the same authority.
+
+
+## Universal Privacy Mode threat model (v0.3.0)
+
+Database encryption at rest does not hide plaintext already sent as MCP tool arguments or results. A client can display, copy, retain, synchronize, or forward those values to a model. standard intentionally preserves this compatibility behavior.
+
+private and strict enforce server-side minimization:
+
+- private search returns only count and note IDs; recent hides title/tags; read and delete require the authenticated Secure Capture path; direct write is not registered by default.
+- strict search returns count only; recent returns only IDs; ordinary MCP never returns full note content.
+- private_note_commit_draft accepts only a short-lived opaque draft ID. The encrypted draft is bound to the hash of the authenticated deployment token and a browser session, consumed once, and removed after commit.
+- Secure Capture checks Host/Origin, uses Bearer login plus HttpOnly/SameSite cookies, no localStorage, bounded request bodies, and no request-body logging.
+
+This is deployment-level authorization, not per-human identity isolation. A shared Bearer token is a shared authority. Do not trust a model-supplied user_id or boolean as an authorization proof.
+
+The secure page is an authenticated content path; its authorized browser can see plaintext by design. No standard MCP server can force every client UI to hide parameters that the client has already received. Client-by-client UI/history validation remains NOT_VERIFIED unless actually performed.
+
+Production guidance:
+
+- bind the Node service to loopback behind an HTTPS reverse proxy;
+- preserve Authorization for /mcp, do not log request bodies, and protect /notes/capture;
+- keep CIPHERNOTE_KEY and the Bearer token in separate protected files;
+- back up the encrypted database and key separately;
+- rollback v0.3.0 by stopping the service, restoring the previous source and environment, and retaining the database (the new secure_drafts table is additive and ignored by v0.2.0).

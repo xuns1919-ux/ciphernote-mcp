@@ -117,7 +117,7 @@ npm start
 
 ## 🌐 Streamable HTTP
 
-v0.2.0 起可以直接提供原生 Streamable HTTP，无需额外 wrapper。HTTP 模式始终要求至少
+v0.3.0 起可以直接提供原生 Streamable HTTP，无需额外 wrapper。HTTP 模式始终要求至少
 32 字符的 Bearer Token；缺少或错误的 Token 返回 `401 Unauthorized`。
 
 生成 Token 并限制文件权限：
@@ -285,3 +285,47 @@ node --check src/server.js
 **数据属于你，密钥也属于你。**
 
 </div>
+
+
+## Universal Privacy Mode（v0.3.0）
+
+CIPHERNOTE_PRIVACY_MODE 默认是 standard，未设置时保持 v0.2.0 的兼容行为：
+
+- standard：五个旧工具全部可见；明文写入、搜索摘要和完整读取仍可能进入 MCP 客户端参数/结果。
+- private：默认不注册明文写入工具；搜索只返回匹配数量和 note ID，recent 隐藏标题/标签，read/delete 需要独立安全页面；增加 private_note_commit_draft。
+- strict：不返回正文、标题或标签；搜索只返回数量，recent 只返回 ID；普通 MCP 不提供明文写入，完整内容仅能在认证的 Secure Capture 页面处理。
+
+标准 MCP 无法控制客户端是否显示、复制或保存已经收到的工具参数。因此 private/strict 不把“折叠工具卡片”当作隐私边界。
+
+### Secure Capture
+
+HTTP 模式启用 private/strict 时，默认提供：
+
+    https://<你的域名>/notes/capture
+
+页面登录使用同一个部署 Bearer Token 建立短时 HttpOnly、SameSite 会话。标题、正文和标签从浏览器通过 HTTPS 直接提交服务端，不经过 MCP 工具参数。
+
+页面支持：
+
+- 直接安全保存；
+- 创建短时一次性 draft_id；
+- MCP 仅调用 private_note_commit_draft({"draft_id":"draft_..."}) 完成提交。
+
+draft 内容在 SQLite 的 secure_drafts 表中加密保存，默认 900 秒过期，成功提交后删除，绑定登录主体并防止重复提交。draft ID 不包含标题或正文。
+
+当前主体绑定是“部署 Bearer Token 的哈希 + 浏览器会话”，不是多用户账户系统。多个用户共享一个 Bearer Token 时仍共享同一权限；需要真正用户隔离时，请为每个主体部署独立实例或在反向代理增加身份映射。不要把 user_id 作为工具参数当作授权依据。
+
+### 配置
+
+    CIPHERNOTE_PRIVACY_MODE=private
+    CIPHERNOTE_SECURE_CAPTURE_ENABLED=true
+    CIPHERNOTE_SECURE_CAPTURE_TTL_SECONDS=900
+    CIPHERNOTE_DIRECT_WRITE_ENABLED=false
+
+private/strict 模式下如果启用 CIPHERNOTE_DIRECT_WRITE_ENABLED=true，普通写入参数可能出现在客户端历史和模型上下文中，不能称为“无明文传输”。
+
+### 能力边界
+
+- 数据库加密、MCP 参数、MCP 返回值、客户端历史和模型上下文是五个不同层面。
+- private/strict 的搜索结果不能让模型假装已经读过正文；只有 note ID/计数可见。
+- 无法实际运行的客户端界面不应标记为隐私 PASS；需分别测试 Operit、Anejul、Kelivo、Opeiro、Claude Desktop、Cherry Studio。

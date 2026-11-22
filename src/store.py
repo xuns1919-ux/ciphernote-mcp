@@ -11,7 +11,9 @@ import json
 import os
 import re
 import sqlite3
+import secrets
 import sys
+import time
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
@@ -30,6 +32,10 @@ def default_db_path() -> Path:
 
 DB_PATH = Path(os.environ.get("CIPHERNOTE_DB", default_db_path()))
 MAX_NOTE_BYTES = 100_000
+DRAFT_TTL_SECONDS = max(60, min(86_400, int(os.environ.get("CIPHERNOTE_SECURE_CAPTURE_TTL_SECONDS", "900"))))
+PRIVACY_MODE = os.environ.get("CIPHERNOTE_PRIVACY_MODE", "standard").strip().lower()
+if PRIVACY_MODE not in {"standard", "private", "strict"}:
+    PRIVACY_MODE = "standard"
 KEY_CONTEXT = b"ciphernote-mcp-content-hmac-v1\0"
 CREDENTIAL_RE = re.compile(
     r"(?:api[_ -]?key|secret|password|passwd|access[_ -]?token|refresh[_ -]?token|cookie|"
@@ -121,6 +127,18 @@ def connect() -> sqlite3.Connection:
         )"""
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at DESC)")
+    db.execute("""CREATE TABLE IF NOT EXISTS secure_drafts (
+        id TEXT PRIMARY KEY,
+        subject_hash TEXT NOT NULL,
+        encrypted_title TEXT NOT NULL,
+        encrypted_content TEXT NOT NULL,
+        encrypted_tags TEXT NOT NULL,
+        nonce BLOB NOT NULL UNIQUE,
+        importance INTEGER NOT NULL CHECK (importance BETWEEN 0 AND 5),
+        created_at TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+    )""")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_secure_drafts_expiry ON secure_drafts(expires_at)")
     db.commit()
     try:
         if os.name != "nt":
@@ -136,6 +154,8 @@ def canonical(title: str, content: str, tags: list[str]) -> bytes:
 
 
 def write_note(args: dict) -> dict:
+    if PRIVACY_MODE != "standard" and not args.get("_secure_capture") and os.environ.get("CIPHERNOTE_DIRECT_WRITE_ENABLED") != "true":
+        return {"success": False, "reason": "direct_write_disabled_in_privacy_mode"}
     title = str(args.get("title") or "").strip()
     content = str(args.get("content") or "")
     raw_tags = args.get("tags") or []
@@ -194,6 +214,8 @@ def unpack(row: sqlite3.Row) -> dict:
 
 
 def read_note(args: dict) -> dict:
+    if PRIVACY_MODE != "standard" and not args.get("_secure_capture"):
+        return {"success": False, "reason": "read_requires_authorization"}
     note_id = str(args.get("note_id") or "")
     with closing(connect()) as db:
         row = db.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
@@ -204,10 +226,15 @@ def recent(args: dict) -> dict:
     limit = max(1, min(20, int(args.get("limit", 5))))
     with closing(connect()) as db:
         rows = db.execute("SELECT * FROM notes ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+    if PRIVACY_MODE == "strict":
+        return {"success": True, "results": [{"note_id": row[0]} for row in rows]}
     results = []
     for row in rows:
         note = unpack(row)
-        results.append({key: note[key] for key in ("note_id", "title", "tags", "created_at", "updated_at", "importance")})
+        if PRIVACY_MODE == "private":
+            results.append({key: note[key] for key in ("note_id", "created_at", "updated_at", "importance")})
+        else:
+            results.append({key: note[key] for key in ("note_id", "title", "tags", "created_at", "updated_at", "importance")})
     return {"success": True, "results": results}
 
 
@@ -228,25 +255,93 @@ def search(args: dict) -> dict:
         score = sum(haystack.count(token) for token in tokens)
         matches.append((score, note["updated_at"], note))
     matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    if PRIVACY_MODE == "strict":
+        return {"success": True, "count": len(matches), "results": []}
     results = []
     for _, _, note in matches[:limit]:
-        results.append({
-            "note_id": note["note_id"],
-            "title": note["title"],
-            "snippet": note["content"][:300],
-            "created_at": note["created_at"],
-            "tags": note["tags"],
-        })
-    return {"success": True, "results": results}
+        if PRIVACY_MODE == "private":
+            results.append({"note_id": note["note_id"]})
+        else:
+            results.append({
+                "note_id": note["note_id"],
+                "title": note["title"],
+                "snippet": note["content"][:300],
+                "created_at": note["created_at"],
+                "tags": note["tags"],
+            })
+    return {"success": True, "count": len(matches), "results": results}
 
 
 def delete_note(args: dict) -> dict:
+    if PRIVACY_MODE != "standard" and not args.get("_secure_capture"):
+        return {"success": False, "reason": "delete_requires_authorization"}
     note_id = str(args.get("note_id") or "")
     with closing(connect()) as db:
         deleted = db.execute("DELETE FROM notes WHERE id = ?", (note_id,)).rowcount == 1
         db.commit()
     return {"success": deleted, "deleted": deleted, **({} if deleted else {"reason": "not_found"})}
 
+
+
+def subject_hash(subject: str) -> str:
+    return hashlib.sha256((subject or "").encode()).hexdigest()
+
+
+def create_draft(args: dict) -> dict:
+    subject = str(args.get("_subject") or "")
+    title = str(args.get("title") or "").strip()
+    content = str(args.get("content") or "")
+    tags = list(dict.fromkeys(str(tag).strip() for tag in (args.get("tags") or []) if str(tag).strip()))
+    if not title or not content:
+        return {"success": False, "reason": "title_and_content_required"}
+    if len(title) > 200 or len(tags) > 20 or any(len(tag) > 80 for tag in tags) or len(content.encode()) > MAX_NOTE_BYTES:
+        return {"success": False, "reason": "input_too_large"}
+    if CREDENTIAL_RE.search("\n".join([title, content, *tags])):
+        return {"success": False, "reason": "credential_storage_not_allowed"}
+    try:
+        importance = max(0, min(5, int(args.get("importance", 0))))
+    except (TypeError, ValueError):
+        return {"success": False, "reason": "invalid_importance"}
+    draft_id = "draft_" + secrets.token_urlsafe(32)
+    nonce = os.urandom(32)
+    created = now()
+    expires = int(time.time()) + DRAFT_TTL_SECONDS
+    with closing(connect()) as db:
+        db.execute(
+            "INSERT INTO secure_drafts VALUES (?,?,?,?,?,?,?,?,?)",
+            (draft_id, subject_hash(subject), encrypt(draft_id, "title", title, nonce),
+             encrypt(draft_id, "content", content, nonce),
+             encrypt(draft_id, "tags", json.dumps(tags, ensure_ascii=False), nonce),
+             sqlite3.Binary(nonce), importance, created, expires),
+        )
+        db.commit()
+    return {"success": True, "draft_id": draft_id, "expires_in_seconds": DRAFT_TTL_SECONDS}
+
+
+def commit_draft(args: dict) -> dict:
+    draft_id = str(args.get("_draft_id") or args.get("draft_id") or "")
+    subject = str(args.get("_subject") or "")
+    if not draft_id.startswith("draft_"):
+        return {"success": False, "reason": "invalid_draft_id"}
+    with closing(connect()) as db:
+        db.execute("DELETE FROM secure_drafts WHERE expires_at <= ?", (int(time.time()),))
+        row = db.execute("SELECT * FROM secure_drafts WHERE id=?", (draft_id,)).fetchone()
+        if row is None or not hmac.compare_digest(row[1], subject_hash(subject)):
+            return {"success": False, "reason": "draft_not_found_or_unauthorized"}
+        nonce = bytes(row[5])
+        try:
+            title = decrypt(draft_id, "title", row[2], nonce)
+            content = decrypt(draft_id, "content", row[3], nonce)
+            tags = json.loads(decrypt(draft_id, "tags", row[4], nonce))
+        except Exception:
+            return {"success": False, "reason": "draft_integrity_failed"}
+        importance = row[6]
+    result = write_note({"title": title, "content": content, "tags": tags, "importance": importance, "_secure_capture": True})
+    if result.get("success"):
+        with closing(connect()) as db:
+            db.execute("DELETE FROM secure_drafts WHERE id=?", (draft_id,))
+            db.commit()
+    return result
 
 def dispatch(request: dict) -> dict:
     if KEY is None:
@@ -259,6 +354,8 @@ def dispatch(request: dict) -> dict:
         "search": search,
         "recent": recent,
         "delete": delete_note,
+        "create_draft": create_draft,
+        "commit_draft": commit_draft,
     }
     operation = operations.get(action)
     if operation is None:

@@ -1,4 +1,5 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { callStore } from "./ciphernote.js";
 import { readFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
@@ -91,6 +92,10 @@ export function loadHttpConfig(env = process.env) {
     throw new Error("CIPHERNOTE_MAX_BODY_BYTES must be between 1024 and 10485760");
   }
 
+  const privacyMode = (env.CIPHERNOTE_PRIVACY_MODE || "standard").trim().toLowerCase();
+  if (!["standard", "private", "strict"].includes(privacyMode)) throw new Error("CIPHERNOTE_PRIVACY_MODE must be standard, private, or strict");
+  const secureCaptureEnabled = env.CIPHERNOTE_SECURE_CAPTURE_ENABLED === "true" ||
+    (env.CIPHERNOTE_SECURE_CAPTURE_ENABLED === undefined && privacyMode !== "standard");
   return {
     host,
     port: parsePort(env.CIPHERNOTE_PORT),
@@ -98,6 +103,8 @@ export function loadHttpConfig(env = process.env) {
     token: loadToken(env),
     allowedHosts: parseAllowedHosts(env.CIPHERNOTE_ALLOWED_HOSTS, host),
     maxBodyBytes,
+    privacyMode,
+    secureCaptureEnabled,
     tls: certFile && keyFile
       ? { cert: readFileSync(certFile), key: readFileSync(keyFile), minVersion: "TLSv1.2" }
       : undefined,
@@ -156,6 +163,68 @@ async function readJsonBody(req, limit) {
   }
 }
 
+
+const captureSessions = new Map();
+
+function tokenSubject(token) {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function captureSession(req) {
+  const match = /(?:^|;\s*)ciphernote_capture=([^;]+)/.exec(req.headers.cookie || "");
+  const session = match && captureSessions.get(match[1]);
+  if (!session || session.expiresAt < Date.now()) return null;
+  return session;
+}
+
+function sameOrigin(req, config) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    return normalizeHostname(parsed.hostname) === normalizeHostname(req.headers.host || "") &&
+      (parsed.protocol === "https:" || parsed.protocol === "http:") &&
+      config.allowedHosts.has(normalizeHostname(parsed.hostname));
+  } catch {
+    return false;
+  }
+}
+
+function capturePage(authenticated) {
+  if (!authenticated) {
+    return '<!doctype html><meta charset="utf-8"><title>CipherNote Secure Capture</title><h1>Secure Capture</h1><p>输入 Bearer Token 建立安全会话。</p><form id="f"><input id="t" type="password" required><button>登录</button></form><pre id="o"></pre><script>f.onsubmit=async(e)=>{e.preventDefault();const r=await fetch("/notes/capture/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({token:t.value})});o.textContent=r.ok?"登录成功，请刷新":"认证失败";if(r.ok)location.reload()}</script>';
+  }
+  return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>CipherNote Secure Capture</title><h1>Secure Capture</h1><p>正文直接发送到服务端，不经过 MCP 工具参数。</p><form id="f"><input id="t" maxlength="200" placeholder="标题" required><textarea id="c" maxlength="100000" placeholder="正文" required></textarea><input id="g" placeholder="标签，用逗号分隔"><input id="i" type="number" min="0" max="5" value="0"><button type="button" id="s">安全保存</button><button type="button" id="d">创建暂存引用</button></form><pre id="o"></pre><script>const body=()=>({title:t.value,content:c.value,tags:g.value.split(",").map(x=>x.trim()).filter(Boolean),importance:Number(i.value)});async function send(path){const r=await fetch(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body())});o.textContent=JSON.stringify(await r.json(),null,2)};s.onclick=()=>send("/notes/capture/save");d.onclick=()=>send("/notes/capture/drafts")</script>';
+}
+
+async function handleCapture(req, res, requestUrl, config, readJsonBody) {
+  if (!config.secureCaptureEnabled || !requestUrl.pathname.startsWith("/notes/capture")) return false;
+  if (!sameOrigin(req, config)) { sendJson(res, 403, { error: "csrf_or_origin_rejected" }); return true; }
+  const secure = config.tls || req.headers["x-forwarded-proto"] === "https";
+  if (req.method === "GET" && requestUrl.pathname === "/notes/capture") {
+    res.writeHead(200, { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" });
+    res.end(capturePage(Boolean(captureSession(req))));
+    return true;
+  }
+  if (req.method === "POST" && requestUrl.pathname === "/notes/capture/login") {
+    const body = await readJsonBody(req, config.maxBodyBytes);
+    if (typeof body.token !== "string" || !hasValidBearer("Bearer " + body.token, config.token)) { sendJson(res, 401, { error: "unauthorized" }); return true; }
+    const id = randomBytes(32).toString("base64url");
+    captureSessions.set(id, { subject: tokenSubject(body.token), expiresAt: Date.now() + 3600000 });
+    sendJson(res, 200, { success: true }, { "set-cookie": "ciphernote_capture=" + id + "; Path=/notes/capture; Max-Age=3600; HttpOnly; SameSite=Strict" + (secure ? "; Secure" : "") });
+    return true;
+  }
+  const session = captureSession(req);
+  if (!session) { sendJson(res, 401, { error: "capture_session_required" }); return true; }
+  if (req.method !== "POST" || !["/notes/capture/save", "/notes/capture/drafts", "/notes/capture/read", "/notes/capture/delete"].includes(requestUrl.pathname)) { sendJson(res, 404, { error: "not_found" }); return true; }
+  const body = await readJsonBody(req, config.maxBodyBytes);
+  const args = { ...body, _secure_capture: true, _subject: session.subject };
+  const action = requestUrl.pathname.endsWith("/save") ? "write" : requestUrl.pathname.endsWith("/drafts") ? "create_draft" : requestUrl.pathname.endsWith("/read") ? "read" : "delete";
+  const response = await callStore(action, args, session.subject);
+  sendJson(res, 200, response);
+  return true;
+}
+
 export function createCipherNoteHttpService(config, serverFactory) {
   const handler = async (req, res) => {
     const requestUrl = new URL(req.url || "/", "http://localhost");
@@ -169,6 +238,7 @@ export function createCipherNoteHttpService(config, serverFactory) {
       sendJson(res, 200, { status: "ok" });
       return;
     }
+    if (await handleCapture(req, res, requestUrl, config, readJsonBody)) return;
     if (requestUrl.pathname !== config.path) {
       sendJson(res, 404, { error: "not_found" });
       return;
@@ -186,7 +256,8 @@ export function createCipherNoteHttpService(config, serverFactory) {
     try {
       const parsedBody = req.method === "POST" ? await readJsonBody(req, config.maxBodyBytes) : undefined;
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-      mcpServer = serverFactory();
+      const match = /^Bearer ([^\s]+)$/.exec(req.headers.authorization || "");
+      mcpServer = serverFactory({ subject: tokenSubject(match ? match[1] : "") });
       await mcpServer.connect(transport);
       await transport.handleRequest(req, res, parsedBody);
     } catch (error) {
